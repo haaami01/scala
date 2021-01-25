@@ -13,14 +13,21 @@
 package scala.tools.nsc.interpreter
 package jline
 
-import java.util.{List => JList}
-
-import org.jline.reader.{Candidate, Completer, CompletingParsedLine, EOFError, EndOfFileException, History, LineReader, ParsedLine, Parser, SyntaxError, UserInterruptException}
-import org.jline.reader.impl.{DefaultParser, LineReaderImpl}
+import java.util.{Collections, List => JList}
+import org.jline.reader.{Candidate, Completer, CompletingParsedLine, EOFError, EndOfFileException, History, LineReader, ParsedLine, Parser, Reference, SyntaxError, UserInterruptException}
+import org.jline.reader.impl.{CompletionMatcherImpl, DefaultParser, LineReaderImpl}
 import org.jline.terminal.Terminal
 
 import shell.{Accumulator, ShellConfig}
 import Parser.ParseContext
+import org.jline.console.{CmdDesc, CmdLine}
+import org.jline.keymap.KeyMap
+import org.jline.utils.AttributedString
+import org.jline.widget.TailTipWidgets.TipType
+import org.jline.widget.{TailTipWidgets}
+
+import java.{lang, util}
+import scala.reflect.internal.Chars
 
 /** A Reader that delegates to JLine3.
  */
@@ -92,14 +99,69 @@ object Reader {
         .variable(SECONDARY_PROMPT_PATTERN, config.encolor(config.continueText)) // Continue prompt
         .variable(WORDCHARS, LineReaderImpl.DEFAULT_WORDCHARS.filterNot("*?.[]~=/&;!#%^(){}<>".toSet))
         .option(Option.DISABLE_EVENT_EXPANSION, true) // Otherwise `scala> println(raw"\n".toList)` gives `List(n)` !!
+        .option(Option.COMPLETE_MATCHER_CAMELCASE, true)
+    }
+    object customCompletionMatcher extends CompletionMatcherImpl {
+      override def compile(options: util.Map[LineReader.Option, lang.Boolean], prefix: Boolean, line: CompletingParsedLine, caseInsensitive: Boolean, errors: Int, originalGroupName: String): Unit = {
+        super.compile(options, prefix, line, caseInsensitive, errors, originalGroupName)
+        // TODO Use Option.COMPLETION_MATCHER_TYPO(false) in once https://github.com/jline/jline3/pull/646
+        matchers.remove(matchers.size() - 2)
+      }
+
+      override def matches(candidates: JList[Candidate]): JList[Candidate] = {
+        val matching = super.matches(candidates)
+        matching
+      }
     }
 
+    builder.completionMatcher(customCompletionMatcher)
+
     val reader = builder.build()
+
+    val desc: java.util.function.Function[CmdLine, CmdDesc] = (cmdLine) => new CmdDesc(util.Arrays.asList(new AttributedString("demo")), Collections.emptyList(), Collections.emptyMap())
+    new TailTipWidgets(reader, desc, 1, TipType.COMPLETER)
+    val keyMap = reader.getKeyMaps.get("main")
+
+    object ScalaShowType {
+      val Name = "scala-show-type"
+      private var lastInvokeLocation: Option[(String, Int)] = None
+      def apply(): Boolean = {
+        val nextInvokeLocation = Some((reader.getBuffer.toString, reader.getBuffer.cursor()))
+        val cursor = reader.getBuffer.cursor()
+        val text   = reader.getBuffer.toString
+        val result = completer.complete(text, cursor, filter = true)
+        if (lastInvokeLocation == nextInvokeLocation) {
+          showTree(result)
+          lastInvokeLocation = None
+        } else {
+          showType(result)
+          lastInvokeLocation = nextInvokeLocation
+        }
+        true
+      }
+      def showType(result: shell.CompletionResult): Unit = {
+        reader.getTerminal.writer.println()
+        reader.getTerminal.writer.println(result.typeAtCursor)
+        reader.callWidget(LineReader.REDRAW_LINE)
+        reader.callWidget(LineReader.REDISPLAY)
+        reader.getTerminal.flush()
+      }
+      def showTree(result: shell.CompletionResult): Unit = {
+        reader.getTerminal.writer.println()
+        reader.getTerminal.writer.println(Naming.unmangle(result.typedTree))
+        reader.callWidget(LineReader.REDRAW_LINE)
+        reader.callWidget(LineReader.REDISPLAY)
+        reader.getTerminal.flush()
+      }
+    }
+    reader.getWidgets().put(ScalaShowType.Name, () => ScalaShowType())
+
     locally {
       import LineReader._
       // VIINS, VICMD, EMACS
       val keymap = if (config.viMode) VIINS else EMACS
       reader.getKeyMaps.put(MAIN, reader.getKeyMaps.get(keymap));
+      keyMap.bind(new Reference(ScalaShowType.Name), KeyMap.ctrl('T'))
     }
     def secure(p: java.nio.file.Path): Unit = {
       try scala.reflect.internal.util.OwnerOnlyChmod.chmodFileOrCreateEmpty(p)
@@ -167,6 +229,12 @@ object Reader {
         val (wordCursor, wordIndex) = current match {
           case Some(t) if t.isIdentifier =>
             (cursor - t.start, tokens.indexOf(t))
+          case Some(t)  =>
+            val isIdentifierStartKeyword = (t.start until t.end).forall(i => Chars.isIdentifierPart(line.charAt(i)))
+            if (isIdentifierStartKeyword)
+              (cursor - t.start, tokens.indexOf(t))
+            else
+              (0, -1)
           case _ =>
             (0, -1)
         }
@@ -223,15 +291,16 @@ object Reader {
  *  It delegates both interfaces to an underlying `Completion`.
  */
 class Completion(delegate: shell.Completion) extends shell.Completion with Completer {
+  var lastPrefix: String = ""
   require(delegate != null)
   // REPL Completion
-  def complete(buffer: String, cursor: Int): shell.CompletionResult = delegate.complete(buffer, cursor)
+  def complete(buffer: String, cursor: Int, filter: Boolean): shell.CompletionResult = delegate.complete(buffer, cursor, filter)
 
   // JLine Completer
   def complete(lineReader: LineReader, parsedLine: ParsedLine, newCandidates: JList[Candidate]): Unit = {
     def candidateForResult(cc: CompletionCandidate): Candidate = {
-      val value = cc.defString
-      val displayed = cc.defString + (cc.arity match {
+      val value = cc.name
+      val displayed = cc.name + (cc.arity match {
         case CompletionCandidate.Nullary => ""
         case CompletionCandidate.Nilary => "()"
         case _ => "("
@@ -246,24 +315,20 @@ class Completion(delegate: shell.Completion) extends shell.Completion with Compl
       val complete = false    // more to complete?
       new Candidate(value, displayed, group, descr, suffix, key, complete)
     }
-    val result = complete(parsedLine.line, parsedLine.cursor)
-    result.candidates.map(_.defString) match {
-      // the presence of the empty string here is a signal that the symbol
-      // is already complete and so instead of completing, we want to show
-      // the user the method signature. there are various JLine 3 features
-      // one might use to do this instead; sticking to basics for now
-      case "" :: defStrings if defStrings.nonEmpty =>
-        // specifics here are cargo-culted from Ammonite
+    val result = complete(parsedLine.line, parsedLine.cursor, filter = false)
+    for (cc <- result.candidates)
+      newCandidates.add(candidateForResult(cc))
+
+    val parsedLineWord = parsedLine.word()
+    result.candidates.filter(_.name == parsedLineWord) match {
+      case Nil =>
+      case exacts =>
         lineReader.getTerminal.writer.println()
-        for (cc <- result.candidates.tail)
-          lineReader.getTerminal.writer.println(cc.defString)
+        for (cc <- exacts)
+          lineReader.getTerminal.writer.println(cc.declString())
         lineReader.callWidget(LineReader.REDRAW_LINE)
         lineReader.callWidget(LineReader.REDISPLAY)
         lineReader.getTerminal.flush()
-      // normal completion
-      case _ =>
-        for (cc <- result.candidates)
-          newCandidates.add(candidateForResult(cc))
     }
   }
 }
