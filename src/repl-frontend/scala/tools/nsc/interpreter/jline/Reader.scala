@@ -103,9 +103,25 @@ object Reader {
     }
     object customCompletionMatcher extends CompletionMatcherImpl {
       override def compile(options: util.Map[LineReader.Option, lang.Boolean], prefix: Boolean, line: CompletingParsedLine, caseInsensitive: Boolean, errors: Int, originalGroupName: String): Unit = {
-        super.compile(options, prefix, line, caseInsensitive, errors, originalGroupName)
-        // TODO Use Option.COMPLETION_MATCHER_TYPO(false) in once https://github.com/jline/jline3/pull/646
-        matchers.remove(matchers.size() - 2)
+        val errorsReduced = line.wordCursor() match {
+          case 0 | 1 | 2 | 3 => 0 // disable JLine's levenshtein-distance based typo matcher for short strings
+          case 4 | 5 => math.max(errors, 1)
+          case _ => errors
+        }
+        super.compile(options, prefix, line, caseInsensitive, errorsReduced, originalGroupName)
+
+        // TODO JLINE All of this can/must be removed after the next JLine upgrade
+        matchers.remove(matchers.size() - 2) // remove ty
+        val wd = line.word();
+        val wdi = if (caseInsensitive) wd.toLowerCase() else  wd
+        val typoMatcherWord = if (prefix) wdi.substring(0, line.wordCursor()) else wdi
+        val fixedTypoMatcher = typoMatcher(
+          typoMatcherWord,
+          errorsReduced,
+          !caseInsensitive, // Fixed in JLine https://github.com/jline/jline3/pull/647, remove the negation when upgrading!
+          originalGroupName
+        )
+        matchers.add(matchers.size - 2, fixedTypoMatcher)
       }
 
       override def matches(candidates: JList[Candidate]): JList[Candidate] = {
@@ -323,12 +339,15 @@ class Completion(delegate: shell.Completion) extends shell.Completion with Compl
     result.candidates.filter(_.name == parsedLineWord) match {
       case Nil =>
       case exacts =>
-        lineReader.getTerminal.writer.println()
-        for (cc <- exacts)
-          lineReader.getTerminal.writer.println(cc.declString())
-        lineReader.callWidget(LineReader.REDRAW_LINE)
-        lineReader.callWidget(LineReader.REDISPLAY)
-        lineReader.getTerminal.flush()
+        val declStrings = exacts.map(_.declString()).filterNot(_ == "")
+        if (declStrings.nonEmpty) {
+          lineReader.getTerminal.writer.println()
+          for (declString <- declStrings)
+            lineReader.getTerminal.writer.println(declString)
+          lineReader.callWidget(LineReader.REDRAW_LINE)
+          lineReader.callWidget(LineReader.REDISPLAY)
+          lineReader.getTerminal.flush()
+        }
     }
   }
 }

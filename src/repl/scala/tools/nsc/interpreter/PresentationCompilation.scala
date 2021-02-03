@@ -192,7 +192,11 @@ trait PresentationCompilation { self: IMain =>
             isDeprecated = isMemberDeprecated(member),
             isUniversal = isMemberUniversal(member),
             declString = () => {
-              val tp = member.prefix memberType sym; sugared.defStringSeenAs(tp)
+              if (sym.isPackageObjectOrClass) ""
+              else {
+                val tp = member.prefix memberType sym;
+                sugared.defStringSeenAs(tp)
+              }
             })
         }
         ccs
