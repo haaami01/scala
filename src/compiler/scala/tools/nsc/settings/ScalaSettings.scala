@@ -242,7 +242,7 @@ trait ScalaSettings extends StandardScalaSettings with Warnings { _: MutableSett
   val YdisableFlatCpCaching  = BooleanSetting    ("-Ydisable-flat-cp-caching", "Do not cache flat classpath representation of classpath elements from jars across compiler instances.").withAbbreviation("-YdisableFlatCpCaching")
   // Zinc adds YdisableFlatCpCaching automatically for straight-to-JAR compilation, this is a way to override that choice.
   val YforceFlatCpCaching  = BooleanSetting    ("-Yforce-flat-cp-caching", "Force caching flat classpath representation of classpath elements from jars across compiler instances. Has precedence over: " + YdisableFlatCpCaching.name).internalOnly()
-  val YzipfsClassPath = BooleanSetting    ("-Yzipfs-class-path", "Use ZipFileSystemProvider, if available, to read classpath JARs to avoid lock contention", true)
+  val YzipfsClassPath = BooleanSetting    ("-Yzipfs-class-path", "Use ZipFileSystemProvider, if available, to read classpath JARs to avoid lock contention")
   val YcachePluginClassLoader  = CachePolicy.setting("plugin", "compiler plugins")
   val YcacheMacroClassLoader   = CachePolicy.setting("macro", "macros")
   val YpartialUnification = BooleanSetting ("-Ypartial-unification", "Enable partial unification in type constructor inference")
