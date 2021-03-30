@@ -12,11 +12,10 @@
 
 package scala.tools.nsc.classpath
 
-import java.io.{Closeable, File}
+import java.io.{Closeable, File, IOException}
 import java.net.URL
 import java.nio.file.{FileSystems, Files}
 import java.util
-
 import scala.reflect.io.{AbstractFile, PlainFile, PlainNioFile}
 import scala.tools.nsc.util.{ClassPath, ClassRepresentation, EfficientClassPath}
 import FileUtils._
@@ -130,6 +129,8 @@ trait JFileDirectoryLookup[FileEntryType <: ClassRepresentation] extends Directo
 
 object JrtClassPath {
   import java.nio.file._, java.net.URI
+  private val jrtClassPathCache = new FileBasedCache[Unit, JrtClassPath]()
+  private val ctSymClassPathCache = new FileBasedCache[Unit, CtSymClassPath]()
   def apply(release: Option[String], closeableRegistry: CloseableRegistry): Option[ClassPath] = {
     import scala.util.Properties._
     if (!isJavaAtLeast("9")) None
@@ -148,8 +149,7 @@ object JrtClassPath {
             val ctSym = Paths.get(javaHome).resolve("lib").resolve("ct.sym")
             if (Files.notExists(ctSym)) None
             else {
-              val classPath = new CtSymClassPath(ctSym, v.toInt)
-              closeableRegistry.registerClosable(classPath)
+              val classPath = ctSymClassPathCache.getOrCreate((), ctSym :: Nil, () => new CtSymClassPath(ctSym, v.toInt), closeableRegistry, true)
               Some(classPath)
             }
           } catch {
@@ -158,7 +158,8 @@ object JrtClassPath {
         case _ =>
           try {
             val fs = FileSystems.getFileSystem(URI.create("jrt:/"))
-            Some(new JrtClassPath(fs))
+            val classPath = jrtClassPathCache.getOrCreate((), Nil, () => new JrtClassPath(fs), closeableRegistry, false)
+            Some(classPath)
           } catch {
             case _: ProviderNotFoundException | _: FileSystemNotFoundException => None
           }
@@ -167,6 +168,64 @@ object JrtClassPath {
   }
 }
 
+final class ZipFsClassPath(val zipPath: java.nio.file.Path, fs: java.nio.file.FileSystem) extends ClassPath with NoSourcePaths with Closeable {
+  import java.nio.file.Path, java.nio.file._
+  type F = Path
+
+  def findClassFile(className: String): Option[AbstractFile] = {
+    val relativePath = FileUtils.dirPath(className)
+    val path = fs.getPath("/", s"$relativePath.class")
+    if (Files.exists(path))
+      Some(new PlainNioFile(path))
+   else None
+  }
+
+  protected def isMatchingFile(f: File): Boolean = f.isClass
+
+  private[nsc] def classes(inPackage: PackageName): Seq[ClassFileEntry] = {
+    list(inPackage, listClasses = true, listPackages = true).classesAndSources.asInstanceOf[Seq[ClassFileEntry]]
+  }
+  override private[nsc] def hasPackage(pkg: PackageName) = Files.isDirectory(fs.getPath(pkg.dirPathTrailingSlash))
+  override private[nsc] def packages(inPackage: PackageName): Seq[PackageEntry] = {
+    list(inPackage, listClasses = true, listPackages = true).packages
+  }
+
+  /**
+   * Returns packages and classes (source or classfile) that are members of `inPackage` (not
+   * recursively). The `inPackage` string is a full package name, e.g., "scala.collection".
+   *
+   * This is the main method uses to find classes, see class `PackageLoader`. The
+   * `rootMirror.rootLoader` is created with `inPackage = ""`.
+   */
+  override private[nsc] def list(inPackage: PackageName) = {
+    list(inPackage, listClasses = true, listPackages = true)
+  }
+  private def list(inPackage: PackageName,
+                   listClasses: Boolean,
+                   listPackages: Boolean): ClassPathEntries = {
+    val dir = fs.getPath("/", inPackage.dirPathTrailingSlash)
+    if (Files.isDirectory(dir)) {
+      val classes = if (listClasses) collection.mutable.ArrayBuffer[ClassFileEntry]() else null
+      val packages = if (listPackages) collection.mutable.ArrayBuffer[PackageEntry]() else null
+      Files.list(dir).iterator().asScala.foreach { f =>
+        if (classes != null && endsClass(f.getFileName.toString))
+          classes += ClassFileEntryImpl(new PlainNioFile(f))
+        else if (packages != null && Files.isDirectory(f)) {
+          val packageName = (if (inPackage.isRoot) "" else inPackage.dottedString + "." ) + f.getFileName.toString.stripSuffix("/")
+          packages += PackageEntryImpl(packageName)
+        }
+      }
+      ClassPathEntries(packages, classes)
+    } else ClassPathEntries.empty
+  }
+  def asURLs: Seq[URL] = Seq(zipPath.toUri.toURL)
+  def asClassPathStrings: Seq[String] = Seq(zipPath.toString)
+  override def close(): Unit = try {
+    fs.close()
+  } catch {
+    case _: IOException => // ignore, JAR may have been deleted
+  }
+}
 /**
   * Implementation `ClassPath` based on the JDK 9 encapsulated runtime modules (JEP-220)
   *

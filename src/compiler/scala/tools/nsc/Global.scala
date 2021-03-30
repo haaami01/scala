@@ -873,6 +873,7 @@ class Global(var currentSettings: Settings, reporter0: Reporter)
       def origin(lookup: ClassPath): Option[String] = lookup match {
         case cp: JFileDirectoryLookup[_] => Some(cp.dir.getPath)
         case cp: ZipArchiveFileLookup[_] => Some(cp.zipFile.getPath)
+        case cp: ZipFsClassPath => Some(cp.zipPath.toString)
         case _ => None
       }
 
